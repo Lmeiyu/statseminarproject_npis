@@ -1,0 +1,187 @@
+---
+title: "count_case"
+author: "Meiyu Lyu"
+date: "2021/10/31"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(EpiEstim)
+library(dplyr)
+library(lubridate)
+```
+Description:
+
+Calculate the transmission rates and weekly growth rate of COVID-19 in each state in the United States before any vaccination.
+
+1. load raw data and eliminate rows corresponding to the situation that there was no local infection
+
+```{r}
+df <- 
+  read.csv(".\\Data\\United_States_COVID-19_Cases_and_Deaths_by_State_over_Time.csv")
+df <- df %>% arrange(submission_date)
+count_cases <- df %>% 
+  select(-c("created_at","consent_cases","consent_deaths")) %>% 
+  mutate(submission_date = mdy(submission_date)) %>% 
+  filter(!(tot_cases == 0 & is.na(conf_cases)))  %>% 
+  arrange(submission_date)
+```
+
+2. keep only pre-vaccination data and add a column indicating week
+
+```{r}
+count_cases_non_vac <- count_cases %>% 
+  filter(submission_date <= as.Date("2020-12-31")) %>% 
+  mutate(week = lubridate::week(submission_date)) %>% 
+  select(week,everything()) %>% 
+  arrange(week,state)
+```
+
+3. Calculate one of our target outcome variables: R_it
+
+Approach:
+
+step1: Calculate daily R_t (the estimated mean of floating weekly transimission rate) in a given state i with function estimate_R from package EpiEstim. We choose to specify the distribution of the serial period and assumes it follows a gamma distribution with mean of 5.9 and standard deviation of 3.9, according to the paper of Liu et al..
+
+step2: With daily R_t, we obtain weekly R_t by averaging daily R_t in a given week.
+```{r warning=FALSE}
+states <- count_cases_non_vac %>% 
+  select(state) %>% 
+  distinct()
+rt_non_vac_daily <- list()
+
+for (i in 1:nrow(states)) {
+  new_case <- count_cases_non_vac %>% 
+    filter(state == states[i,1]) %>% 
+    mutate(new_case = max(new_case,0)) %>% 
+    select(new_case)
+  n <- nrow(new_case)
+  names(new_case) <- "I"
+  res <- estimate_R(new_case,
+                    method = "parametric_si",
+                    config = make_config(list(mean_si = 5.9, 
+                                     std_si = 3.9)))
+  r_t <- res$R$`Mean(R)`
+  rt_non_vac_daily[[i]] <- r_t
+}
+count_cases_non_vac$rt_daily <- rep(0,nrow(count_cases_non_vac))
+for(i in 1: nrow(states)) {
+  n <- length(rt_non_vac_daily[[i]])
+  count_cases_non_vac$rt_daily[count_cases_non_vac$state == states[i,1]][1:n] <- rt_non_vac_daily[[i]]
+}
+rt <- count_cases_non_vac %>% 
+  select(week,state,rt_daily) %>% 
+  group_by(state,week) %>% 
+  mutate(wkly_rt = mean(rt_daily)) %>% 
+  distinct(week,.keep_all = TRUE) %>% 
+  select(-rt_daily) %>% 
+  ungroup() %>% 
+  group_by(state) %>% 
+  filter(week < max(week)) %>% 
+  arrange(state,week)
+
+```
+
+4. Calculate the other target outcome variable: Y_it
+
+Y_it is defined as the (log) weekly case growth rate in state i. If the number of weekly new case in a given state is zero or negative, we assume the growth rate is zero. The result data should be log of the weekly new cases reported for the 7-day period, from week 2 to week 48, excluding datapoints in week 1.
+
+```{r warning=FALSE}
+case_non_vac_wkly <- count_cases_non_vac %>% 
+  select(c(week,state,new_case)) %>% 
+  group_by(week,state) %>% 
+  mutate(wkly_new_cases = sum(new_case)) %>% 
+  distinct(wkly_new_cases,.keep_all = TRUE) %>% 
+  select(-new_case) %>% 
+  arrange(state,week)
+yt <- function(x) {
+  wkly <- x
+  log_wkly <- case_when(wkly < 0 ~ 0,
+                        wkly == 0 ~ 0,
+                        wkly > 0 ~ log(wkly))
+  n <- length(x)
+  y_t <- rep(NA,n)
+  y_t[1] <- 0
+  y_t[2:n] <- log_wkly[2:n] - log_wkly[1:n-1]
+  return(y_t)
+}
+yt_non_vac_wkly <- case_non_vac_wkly %>% 
+  group_by(state) %>% 
+  mutate(yt = yt(wkly_new_cases)) %>% 
+  filter(week > min(week))
+```
+
+Sensitivity Check:
+
+1. Calculate target outcome R_it with different assumptions on the inference of serial period.
+
+```{r}
+# Create a function for further use
+cal_rt <- function(sl.mean,sl.sd) {
+  rt_non_vac_daily <- list()
+
+for (i in 1:nrow(states)) {
+  new_case <- count_cases_non_vac %>% 
+    filter(state == states[i,1]) %>% 
+    mutate(new_case = max(new_case,0)) %>% 
+    select(new_case)
+  n <- nrow(new_case)
+  names(new_case) <- "I"
+  res <- estimate_R(new_case,
+                    method = "parametric_si",
+                    config = make_config(list(mean_si = sl.mean, 
+                                     std_si = sl.sd)))
+  r_t <- res$R$`Mean(R)`
+  rt_non_vac_daily[[i]] <- r_t
+}
+count_cases_non_vac$rt_daily <- rep(0,nrow(count_cases_non_vac))
+for(i in 1: nrow(states)) {
+  n <- length(rt_non_vac_daily[[i]])
+  count_cases_non_vac$rt_daily[count_cases_non_vac$state == states[i,1]][1:n] <- rt_non_vac_daily[[i]]
+}
+rt <- count_cases_non_vac %>% 
+  select(week,state,rt_daily) %>% 
+  group_by(state,week) %>% 
+  mutate(wkly_rt = mean(rt_daily)) %>% 
+  distinct(week,.keep_all = TRUE) %>% 
+  select(-rt_daily) %>% 
+  ungroup() %>% 
+  group_by(state) %>% 
+  filter(week < max(week)) %>% 
+  arrange(state,week)
+
+return(rt)
+}
+```
+
+According to a meta-analysis on the serial interval of COVID-19, the mean serial interval varies from 3.95 (2.80, 5.10) to 7.50 (4.10, 10.9) days and the pooled estimate for the serial interval was 5.40 (5.19, 5.61) and 5.19 (4.37, 6.02) days by the fixed and random effects model, respectively(Rai et al., 2021). We will try two sets of assumptions on parameters that are gained from fitting a gamma distribution. 
+
+(1) Mean of 3.95 days and SD of 4.24 days, gained from fitting a gamma distribution with data of 135 confirmed cases reported by the Tianjin Municipal Health Commission from 14 January to 27 February 2020(Ganyani et al., 2020).
+```{r warning=FALSE}
+rt2 <- cal_rt(sl.mean = 3.95,sl.sd = 4.24)
+```
+
+(2) Mean of 6.3 days and SD of 4.2 days, gained from fitting a gamma distribution with data provided by the Shenzhen Center for Disease Control and Prevention identified 391 SARS-CoV-2 cases and 1286 close contacts from Jan 14 to Feb 12, 2020(Bi et al.,2020).
+```{r warning=FALSE}
+rt3 <- cal_rt(sl.mean = 6.3,sl.sd = 4.2)
+```
+
+```{r}
+write.csv(yt_non_vac_wkly,file = ".\\Data\\yt_non_vac_wkly.csv")
+write.csv(rt,file = ".\\Data\\rt_non_vac_wkly.csv")
+write.csv(rt2,file = ".\\Data\\rt_non_vac_wkly2.csv")
+write.csv(rt3,file = ".\\Data\\rt_non_vac_wkly3.csv")
+```
+
+```{r}
+joined <- left_join(rt,yt_non_vac_wkly,by = c("week" = "week",
+                                              "state" = "state"))
+write.csv(joined,file = ".\\Data\\joined_rt_yt.csv")
+joined2 <- left_join(rt2,yt_non_vac_wkly,by = c("week" = "week",
+                                              "state" = "state"))
+write.csv(joined,file = ".\\Data\\joined_rt2_yt.csv")
+joined3 <- left_join(rt3,yt_non_vac_wkly,by = c("week" = "week",
+                                              "state" = "state"))
+write.csv(joined,file = ".\\Data\\joined_rt3_yt.csv")
+```
